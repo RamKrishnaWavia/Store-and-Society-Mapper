@@ -1,86 +1,110 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from math import radians, cos, sin, asin, sqrt
 import io
+from scipy.spatial import cKDTree
+from math import radians, cos, sin, asin, sqrt
 
-# Haversine formula to calculate distance between two lat/lon points
-def haversine(lat1, lon1, lat2, lon2):
-    lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
-    dlon = lon2 - lon1 
-    dlat = lat2 - lat1 
-    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-    c = 2 * asin(sqrt(a)) 
-    r = 6371  # Radius of earth in kilometers
-    return c * r
+# Haversine formula
+EARTH_RADIUS_KM = 6371.0
+
+def haversine_np(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+    return 2 * EARTH_RADIUS_KM * np.arcsin(np.sqrt(a))
 
 st.title("Society to Nearest Dark Store Mapper")
 
-# Downloadable sample template
+# Downloadable sample CSV templates
 sample_societies = pd.DataFrame({
     'City': ['Ahmedabad-Gandhinagar'],
-    'DC': ['Ahmedabad-DC'],
-    'DS': ['Gota V2 DS'],
-    'Hub': ['Gota V2 Hub'],
-    'Area': ['Gota V2 Area'],
-    'Drop_point': ['Gota V2 DP'],
-    'id': [2587],
     'Society_name': ['Aditya Parivesh'],
     'latitude': [23.038891],
-    'longitude': [72.618126],
-    'Flat Counts': [150],
-    'Status': ['ACTIVE']
+    'longitude': [72.618126]
 })
 
 sample_darkstores = pd.DataFrame({
-    'City': ['Ahmedabad'],
     'Store name as per projects': ['South Bopal'],
     'Latitude': [23.018329],
     'Longitude': [72.469856]
 })
 
-buffer = io.BytesIO()
-with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-    sample_societies.to_excel(writer, sheet_name='Societies', index=False)
-    sample_darkstores.to_excel(writer, sheet_name='Dark Stores', index=False)
-
 st.download_button(
-    label="Download Input Template",
-    data=buffer.getvalue(),
-    file_name="society_store_input_template.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    label="Download Societies Template (CSV)",
+    data=sample_societies.to_csv(index=False).encode(),
+    file_name="societies_template.csv",
+    mime="text/csv"
 )
 
-uploaded_file = st.file_uploader("Upload Excel File with 'Societies' and 'Dark Stores' sheets", type=["xlsx"])
+st.download_button(
+    label="Download Dark Stores Template (CSV)",
+    data=sample_darkstores.to_csv(index=False).encode(),
+    file_name="darkstores_template.csv",
+    mime="text/csv"
+)
 
-if uploaded_file:
-    xls = pd.ExcelFile(uploaded_file)
-    societies_df = xls.parse('Societies')
-    darkstores_df = xls.parse('Dark Stores')
+societies_file = st.file_uploader("Upload Societies CSV", type=["csv"])
+darkstores_file = st.file_uploader("Upload Dark Stores CSV", type=["csv"])
 
-    # Create a result list
-    results = []
+if societies_file and darkstores_file:
+    with st.spinner("Processing... Please wait."):
+        societies_df = pd.read_csv(societies_file)
+        darkstores_df = pd.read_csv(darkstores_file)
 
-    for _, soc_row in societies_df.iterrows():
-        min_dist = float('inf')
-        nearest_store = None
+        # Convert lat/lon to radians for efficient vectorized distance
+        darkstore_coords = np.radians(darkstores_df[['Latitude', 'Longitude']].values)
+        society_coords = np.radians(societies_df[['latitude', 'longitude']].values)
 
-        for _, store_row in darkstores_df.iterrows():
-            dist = haversine(soc_row['latitude'], soc_row['longitude'], store_row['Latitude'], store_row['Longitude'])
-            if dist < min_dist:
-                min_dist = dist
-                nearest_store = store_row['Store name as per projects']
+        # Build KDTree and query
+        tree = cKDTree(darkstore_coords)
+        dist_rad, idx = tree.query(society_coords, k=1)
 
-        results.append({
-            'Society Name': soc_row['Society_name'],
-            'Society Lat': soc_row['latitude'],
-            'Society Lon': soc_row['longitude'],
-            'Nearest Dark Store': nearest_store,
-            'Distance (km)': round(min_dist, 2)
+        # Compute haversine distance in km
+        dists_km = haversine_np(societies_df['latitude'].values, societies_df['longitude'].values,
+                                darkstores_df.iloc[idx]['Latitude'].values,
+                                darkstores_df.iloc[idx]['Longitude'].values)
+
+        # Build result DataFrame
+        result_df = pd.DataFrame({
+            'City': societies_df['City'],
+            'Society Name': societies_df['Society_name'],
+            'Society Lat': societies_df['latitude'],
+            'Society Lon': societies_df['longitude'],
+            'Nearest Dark Store': darkstores_df.iloc[idx]['Store name as per projects'].values,
+            'Distance (km)': np.round(dists_km, 2)
         })
 
-    result_df = pd.DataFrame(results)
-    st.write("### Mapping Result")
-    st.dataframe(result_df)
+        st.success("Mapping complete!")
 
-    st.download_button("Download Result as CSV", result_df.to_csv(index=False), "society_store_mapping.csv")
+        # Filters
+        with st.expander("🔎 Filter Results"):
+            selected_store = st.multiselect("Select Dark Stores", options=result_df['Nearest Dark Store'].unique(), default=None)
+            max_distance = st.slider("Maximum Distance (km)", min_value=0.0, max_value=float(result_df['Distance (km)'].max()), value=float(result_df['Distance (km)'].max()), step=0.1)
+            filtered_df = result_df.copy()
+            if selected_store:
+                filtered_df = filtered_df[filtered_df['Nearest Dark Store'].isin(selected_store)]
+            filtered_df = filtered_df[filtered_df['Distance (km)'] <= max_distance]
+
+        st.write("### Filtered Mapping Result")
+        st.dataframe(filtered_df)
+
+        # Grouping option
+        with st.expander("🔍 Group by Store or City"):
+            tab1, tab2 = st.tabs(["By Store", "By City"])
+            with tab1:
+                grouped_store = filtered_df.groupby('Nearest Dark Store').size().reset_index(name='Total Societies')
+                st.dataframe(grouped_store)
+            with tab2:
+                grouped_city = filtered_df.groupby('City').size().reset_index(name='Total Societies')
+                st.dataframe(grouped_city)
+
+        # CSV export
+        csv_data = filtered_df.to_csv(index=False).encode()
+        st.download_button(
+            label="📥 Download Filtered Result as CSV",
+            data=csv_data,
+            file_name="filtered_society_store_mapping.csv",
+            mime="text/csv"
+        )
